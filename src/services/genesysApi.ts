@@ -88,8 +88,16 @@ export async function createTransaction(data: CreateTransactionRequest): Promise
 
     const externalId = `nubank_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    // Construir objeto de cliente conforme documentação
-    const customerData: any = {
+    // Construir objeto de cliente conforme documentação da API Genesys
+    // Nota: A API Genesys NÃO aceita campo 'address' dentro de 'customer'
+    // Criar objeto limpo apenas com campos permitidos
+    const customerData: {
+      name: string;
+      email: string;
+      document: string;
+      document_type: 'CPF';
+      phone: string;
+    } = {
       name: data.customerName || 'Cliente',
       email: data.customerEmail || 'cliente@example.com',
       document: data.cpf.replace(/\D/g, ''), // Remove caracteres não numéricos
@@ -97,24 +105,15 @@ export async function createTransaction(data: CreateTransactionRequest): Promise
       phone: data.customerPhone || '11999999999',
     };
 
-    // Adicionar endereço se disponível
-    if (data.customerAddress) {
-      customerData.address = {
-        cep: data.customerAddress.zipcode?.replace(/\D/g, '') || '',
-        city: data.customerAddress.city || '',
-        state: data.customerAddress.estado || '',
-        number: data.customerAddress.numero || '',
-        street: data.customerAddress.logradouro || '',
-        complement: data.customerAddress.complemento || '',
-        neighborhood: data.customerAddress.bairro || '',
-      };
-    }
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const webhookUrl = supabaseUrl 
+      ? `${supabaseUrl}/functions/v1/genesys-webhook`
+      : undefined;
 
     const requestBody: any = {
       external_id: externalId,
       total_amount: data.amount,
       payment_method: 'PIX',
-      webhook_url: `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/genesys-webhook`,
       items: [
         {
           id: 'product_' + Date.now(),
@@ -128,6 +127,11 @@ export async function createTransaction(data: CreateTransactionRequest): Promise
       ip: '127.0.0.1',
       customer: customerData,
     };
+
+    // Adicionar webhook_url apenas se estiver configurado
+    if (webhookUrl) {
+      requestBody.webhook_url = webhookUrl;
+    }
 
     const response = await fetch(`${config.apiUrl}/v1/transactions`, {
       method: 'POST',
@@ -207,42 +211,68 @@ export async function createTransaction(data: CreateTransactionRequest): Promise
       ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(pixPayload)}`
       : '';
 
-    const { data: transaction, error: dbError } = await supabase
-      .from('transactions')
-      .insert({
-        genesys_transaction_id: genesysTransaction.id,
-        cpf: data.cpf,
-        amount: data.amount,
-        pix_key: data.pixKey,
-        qr_code: pixPayload,
-        qr_code_image: qrCodeImageUrl,
-        status: genesysTransaction.status.toLowerCase(),
-        expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      })
-      .select()
-      .single();
+    // Tentar salvar no Supabase se disponível (opcional)
+    // Reutiliza a variável supabaseUrl já declarada acima
+    const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+    
+    if (supabaseUrl && supabaseKey) {
+      try {
+        const { data: transaction, error: dbError } = await supabase
+          .from('transactions')
+          .insert({
+            genesys_transaction_id: genesysTransaction.id,
+            cpf: data.cpf,
+            amount: data.amount,
+            pix_key: data.pixKey,
+            qr_code: pixPayload,
+            qr_code_image: qrCodeImageUrl,
+            status: genesysTransaction.status.toLowerCase(),
+            expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+          })
+          .select()
+          .single();
 
-    if (dbError) {
-      throw new Error(`Database error: ${dbError.message}`);
+        if (!dbError && transaction) {
+          console.log('Transaction saved to database:', transaction);
+
+          if (data.createReceipt !== false) {
+            await supabase
+              .from('payment_receipts')
+              .insert({
+                transaction_id: transaction.id,
+                cpf: data.cpf,
+                customer_name: data.customerName || 'Cliente',
+                amount: data.amount,
+                status: 'pending_receipt',
+              })
+              .select()
+              .single();
+          }
+
+          return transaction as Transaction;
+        }
+      } catch (dbError: any) {
+        console.warn('Failed to save transaction to database (continuing anyway):', dbError.message);
+      }
     }
 
-    console.log('Transaction saved to database:', transaction);
+    // Retornar transação sem salvar no banco (modo direto)
+    const transaction: Transaction = {
+      id: genesysTransaction.id,
+      genesys_transaction_id: genesysTransaction.id,
+      cpf: data.cpf,
+      amount: data.amount,
+      pix_key: data.pixKey,
+      qr_code: pixPayload,
+      qr_code_image: qrCodeImageUrl,
+      status: genesysTransaction.status.toLowerCase(),
+      expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
 
-    if (data.createReceipt !== false) {
-      await supabase
-        .from('payment_receipts')
-        .insert({
-          transaction_id: transaction.id,
-          cpf: data.cpf,
-          customer_name: data.customerName || 'Cliente',
-          amount: data.amount,
-          status: 'pending_receipt',
-        })
-        .select()
-        .single();
-    }
-
-    return transaction as Transaction;
+    console.log('Transaction created (without database):', transaction);
+    return transaction;
   } catch (error) {
     console.error('Error creating transaction:', error);
     throw error;
